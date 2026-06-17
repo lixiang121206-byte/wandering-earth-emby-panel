@@ -1,0 +1,164 @@
+version: '3.8'
+
+services:
+  emby-panel:
+    image: python:3.10-slim
+    container_name: wandering_earth_emby
+    restart: unless-stopped
+    ports:
+      - "8080:5000"
+    environment:
+      - EMBY_SERVERS=[{"name":"主服","url":"http://192.168.1.100:8096","api_key":"your_emby_api_key","lines":"http://line1.com,http://line2.com"}]
+      - MOVIEPILOT_URL=http://192.168.1.200:3000   # 可选，不填则求片通过后不自动订阅
+      - MOVIEPILOT_API_KEY=your_moviepilot_key
+      - ADMIN_USER=admin
+      - ADMIN_PASS=cinema2024
+      - SECRET_KEY=change-this-to-random
+    volumes:
+      - ./data:/app/data
+    working_dir: /app
+    command: >
+      bash -c "
+      pip install flask requests &&
+      mkdir -p templates data &&
+      cat > app.py << 'PYEOF'
+      import os, sqlite3, hashlib, json, random, string
+      from datetime import datetime, timedelta
+      from functools import wraps
+      from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+      import requests
+
+      app = Flask(__name__)
+      app.secret_key = os.environ.get('SECRET_KEY', 'super-secret-wandering')
+
+      # 从环境变量加载初始服务器列表
+      INIT_SERVERS = json.loads(os.environ.get('EMBY_SERVERS', '[]'))
+      MOVIEPILOT_URL = os.environ.get('MOVIEPILOT_URL', '').rstrip('/')
+      MOVIEPILOT_API_KEY = os.environ.get('MOVIEPILOT_API_KEY', '')
+      ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
+      ADMIN_PASS = os.environ.get('ADMIN_PASS', 'cinema2024')
+      DB_PATH = 'data/panel.db'
+
+      # 初始化数据库
+      def init_db():
+          os.makedirs('data', exist_ok=True)
+          conn = sqlite3.connect(DB_PATH)
+          c = conn.cursor()
+          c.execute('''CREATE TABLE IF NOT EXISTS servers
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT, url TEXT, api_key TEXT, lines TEXT)''')
+          c.execute('''CREATE TABLE IF NOT EXISTS users
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        server_id INTEGER,
+                        emby_user_id TEXT,
+                        username TEXT UNIQUE,
+                        password_hash TEXT,
+                        expire_date TEXT,
+                        disabled INTEGER DEFAULT 0,
+                        blocked_devices TEXT DEFAULT '',
+                        created_at TEXT)''')
+          c.execute('''CREATE TABLE IF NOT EXISTS requests
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER,
+                        title TEXT,
+                        year TEXT,
+                        type TEXT DEFAULT 'movie',
+                        status TEXT DEFAULT 'pending',
+                        created_at TEXT)''')
+          c.execute('''CREATE TABLE IF NOT EXISTS cards
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        code TEXT UNIQUE,
+                        days INTEGER,
+                        created_by TEXT,
+                        used_by INTEGER,
+                        used_at TEXT,
+                        is_used INTEGER DEFAULT 0)''')
+          # 导入初始服务器
+          for s in INIT_SERVERS:
+              c.execute('INSERT OR IGNORE INTO servers (name, url, api_key, lines) VALUES (?,?,?,?)',
+                        (s['name'], s['url'], s['api_key'], s.get('lines','')))
+          conn.commit()
+          conn.close()
+
+      init_db()
+
+      def hash_pass(pw): return hashlib.sha256(pw.encode()).hexdigest()
+      def get_db(): 
+          conn = sqlite3.connect(DB_PATH)
+          conn.row_factory = sqlite3.Row
+          return conn
+
+      # 通用 Emby API 调用（根据服务器ID）
+      def emby_api(server_id, endpoint, method='GET', data=None):
+          conn = get_db()
+          srv = conn.execute('SELECT url, api_key FROM servers WHERE id=?', (server_id,)).fetchone()
+          conn.close()
+          if not srv: return None
+          url = f\"{srv['url']}/emby/{endpoint}\"
+          headers = {'X-Emby-Token': srv['api_key']}
+          try:
+              if method == 'POST':
+                  if data:
+                      headers['Content-Type'] = 'application/json'
+                      resp = requests.post(url, headers=headers, json=data, timeout=10)
+                  else:
+                      resp = requests.post(url, headers=headers, timeout=10)
+              else:
+                  resp = requests.get(url, headers=headers, timeout=10)
+              if resp.status_code in (200,201,204):
+                  try: return resp.json()
+                  except: return {}
+              return None
+          except: return None
+
+      # ---------- 装饰器 ----------
+      def login_required(f):
+          @wraps(f)
+          def decorated(*args, **kwargs):
+              if not session.get('user_id'):
+                  return redirect(url_for('login'))
+              return f(*args, **kwargs)
+          return decorated
+
+      def admin_required(f):
+          @wraps(f)
+          def decorated(*args, **kwargs):
+              if not session.get('admin_logged_in'):
+                  return redirect(url_for('admin_login'))
+              return f(*args, **kwargs)
+          return decorated
+
+      # ---------- 注册 ----------
+      @app.route('/register', methods=['GET','POST'])
+      def register():
+          conn = get_db()
+          servers = conn.execute('SELECT id, name FROM servers').fetchall()
+          if request.method == 'POST':
+              username = request.form['username'].strip()
+              password = request.form['password'].strip()
+              server_id = request.form.get('server_id', type=int)
+              if not username or not password or not server_id:
+                  flash('All fields required', 'error')
+                  return redirect(url_for('register'))
+              existing = conn.execute('SELECT id FROM users WHERE username=?', (username,)).fetchone()
+              if existing:
+                  flash('Username already exists', 'error')
+                  conn.close()
+                  return redirect(url_for('register'))
+              user_id = emby_api(server_id, 'Users/New', 'POST', {'Name': username, 'Password': password})
+              if not user_id or not user_id.get('Id'):
+                  flash('Failed to create Emby account', 'error')
+                  conn.close()
+                  return redirect(url_for('register'))
+              conn.execute('INSERT INTO users (server_id, emby_user_id, username, password_hash, expire_date, disabled, created_at) VALUES (?,?,?,?,?,?,?)',
+                           (server_id, user_id['Id'], username, hash_pass(password), None, 0, datetime.now().isoformat()))
+              conn.commit()
+              conn.close()
+              flash('Registration successful! Welcome to the Wandering Earth.', 'success')
+              return redirect(url_for('login'))
+          conn.close()
+          return render_template('register.html', servers=servers)
+
+      # ---------- 用户登录/中心 ----------
+      @app.route('/login', methods=['GET','POST'])
+      def login
