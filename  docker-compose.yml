@@ -9,7 +9,7 @@ services:
       - "8080:5000"
     environment:
       - EMBY_SERVERS=[{"name":"主服","url":"http://192.168.1.100:8096","api_key":"your_emby_api_key","lines":"http://line1.com,http://line2.com"}]
-      - MOVIEPILOT_URL=http://192.168.1.200:3000   # 可选，不填则求片通过后不自动订阅
+      - MOVIEPILOT_URL=http://192.168.1.200:3000
       - MOVIEPILOT_API_KEY=your_moviepilot_key
       - ADMIN_USER=admin
       - ADMIN_PASS=cinema2024
@@ -25,13 +25,12 @@ services:
       import os, sqlite3, hashlib, json, random, string
       from datetime import datetime, timedelta
       from functools import wraps
-      from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+      from flask import Flask, render_template, request, redirect, url_for, session, flash
       import requests
 
       app = Flask(__name__)
       app.secret_key = os.environ.get('SECRET_KEY', 'super-secret-wandering')
 
-      # 从环境变量加载初始服务器列表
       INIT_SERVERS = json.loads(os.environ.get('EMBY_SERVERS', '[]'))
       MOVIEPILOT_URL = os.environ.get('MOVIEPILOT_URL', '').rstrip('/')
       MOVIEPILOT_API_KEY = os.environ.get('MOVIEPILOT_API_KEY', '')
@@ -39,7 +38,6 @@ services:
       ADMIN_PASS = os.environ.get('ADMIN_PASS', 'cinema2024')
       DB_PATH = 'data/panel.db'
 
-      # 初始化数据库
       def init_db():
           os.makedirs('data', exist_ok=True)
           conn = sqlite3.connect(DB_PATH)
@@ -73,7 +71,6 @@ services:
                         used_by INTEGER,
                         used_at TEXT,
                         is_used INTEGER DEFAULT 0)''')
-          # 导入初始服务器
           for s in INIT_SERVERS:
               c.execute('INSERT OR IGNORE INTO servers (name, url, api_key, lines) VALUES (?,?,?,?)',
                         (s['name'], s['url'], s['api_key'], s.get('lines','')))
@@ -83,12 +80,11 @@ services:
       init_db()
 
       def hash_pass(pw): return hashlib.sha256(pw.encode()).hexdigest()
-      def get_db(): 
+      def get_db():
           conn = sqlite3.connect(DB_PATH)
           conn.row_factory = sqlite3.Row
           return conn
 
-      # 通用 Emby API 调用（根据服务器ID）
       def emby_api(server_id, endpoint, method='GET', data=None):
           conn = get_db()
           srv = conn.execute('SELECT url, api_key FROM servers WHERE id=?', (server_id,)).fetchone()
@@ -111,7 +107,6 @@ services:
               return None
           except: return None
 
-      # ---------- 装饰器 ----------
       def login_required(f):
           @wraps(f)
           def decorated(*args, **kwargs):
@@ -128,7 +123,17 @@ services:
               return f(*args, **kwargs)
           return decorated
 
-      # ---------- 注册 ----------
+      @app.route('/posters')
+      def posters():
+          conn = get_db()
+          srv = conn.execute('SELECT id, name, url, api_key FROM servers LIMIT 1').fetchone()
+          conn.close()
+          if not srv:
+              return 'No server configured', 404
+          items_data = emby_api(srv['id'], 'Items?IncludeItemTypes=Movie,Series&SortBy=Random&Limit=60&Recursive=true&ImageTypeLimit=1&Fields=PrimaryImageAspectRatio')
+          items = items_data.get('Items', []) if items_data else []
+          return render_template('posters.html', server=srv, items=items)
+
       @app.route('/register', methods=['GET','POST'])
       def register():
           conn = get_db()
@@ -152,13 +157,4 @@ services:
                   return redirect(url_for('register'))
               conn.execute('INSERT INTO users (server_id, emby_user_id, username, password_hash, expire_date, disabled, created_at) VALUES (?,?,?,?,?,?,?)',
                            (server_id, user_id['Id'], username, hash_pass(password), None, 0, datetime.now().isoformat()))
-              conn.commit()
-              conn.close()
-              flash('Registration successful! Welcome to the Wandering Earth.', 'success')
-              return redirect(url_for('login'))
-          conn.close()
-          return render_template('register.html', servers=servers)
-
-      # ---------- 用户登录/中心 ----------
-      @app.route('/login', methods=['GET','POST'])
-      def login
+  
