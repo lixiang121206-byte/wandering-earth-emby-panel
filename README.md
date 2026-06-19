@@ -75,18 +75,6 @@ MOVIEPILOT_API_KEY 否 mp_key MoviePilot API 密钥
 
 ---
 
-🖼️ 界面预览
-
-注册页面 用户中心 海报墙
-screenshots/register.png screenshots/dashboard.png screenshots/posters.png
-
-管理后台 播放监控 求片审核
-screenshots/admin.png screenshots/monitor.png screenshots/requests.png
-
-你可以将实际截图放置于仓库的 screenshots 文件夹下，然后替换上述路径。
-
----
-
 🧩 模块详解
 
 多服务器 & 多线路
