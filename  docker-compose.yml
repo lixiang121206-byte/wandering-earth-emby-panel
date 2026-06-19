@@ -9,8 +9,8 @@ services:
       - "8080:5000"
     environment:
       - EMBY_SERVERS=[{"name":"主服","url":"http://192.168.1.100:8096","api_key":"your_emby_api_key","lines":"http://line1.com,http://line2.com"}]
-      - MOVIEPILOT_URL=http://192.168.1.200:3000
-      - MOVIEPILOT_API_KEY=your_moviepilot_key
+      - MOVIEPILOT_URL=http://192.168.1.200:3000            # 可选，不需要可删除此行
+      - MOVIEPILOT_API_KEY=your_moviepilot_key              # 可选，不需要可删除此行
       - ADMIN_USER=admin
       - ADMIN_PASS=cinema2024
       - SECRET_KEY=change-this-to-random
@@ -22,10 +22,10 @@ services:
       pip install flask requests &&
       mkdir -p templates data &&
       cat > app.py << 'PYEOF'
-      import os, sqlite3, hashlib, json, random, string
+      import os, sqlite3, hashlib, json, random, string, time, threading
       from datetime import datetime, timedelta
       from functools import wraps
-      from flask import Flask, render_template, request, redirect, url_for, session, flash
+      from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
       import requests
 
       app = Flask(__name__)
@@ -71,6 +71,18 @@ services:
                         used_by INTEGER,
                         used_at TEXT,
                         is_used INTEGER DEFAULT 0)''')
+          c.execute('''CREATE TABLE IF NOT EXISTS playback_logs
+                       (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        server_id INTEGER,
+                        emby_user_id TEXT,
+                        username TEXT,
+                        device_name TEXT,
+                        client_ip TEXT,
+                        item_name TEXT,
+                        item_type TEXT,
+                        start_time TEXT,
+                        end_time TEXT,
+                        duration_sec INTEGER DEFAULT 0)''')
           for s in INIT_SERVERS:
               c.execute('INSERT OR IGNORE INTO servers (name, url, api_key, lines) VALUES (?,?,?,?)',
                         (s['name'], s['url'], s['api_key'], s.get('lines','')))
@@ -107,6 +119,58 @@ services:
               return None
           except: return None
 
+      # 后台同步播放记录
+      def sync_playback():
+          while True:
+              try:
+                  conn = get_db()
+                  servers = conn.execute('SELECT * FROM servers').fetchall()
+                  now = datetime.now().isoformat()
+                  for srv in servers:
+                      sessions = emby_api(srv['id'], 'Sessions')
+                      if not sessions: continue
+                      active_user_ids = set()
+                      for sess in sessions:
+                          uid = sess.get('UserId')
+                          if not uid: continue
+                          active_user_ids.add(uid)
+                          device = sess.get('DeviceName', 'Unknown')
+                          ip = sess.get('RemoteEndPoint', 'Unknown')
+                          item = sess.get('NowPlayingItem', {})
+                          item_name = item.get('Name', '')
+                          item_type = item.get('Type', '')
+                          username = sess.get('UserName', '')
+                          existing = conn.execute(
+                              'SELECT id FROM playback_logs WHERE server_id=? AND emby_user_id=? AND end_time IS NULL',
+                              (srv['id'], uid)
+                          ).fetchone()
+                          if existing:
+                              conn.execute('UPDATE playback_logs SET device_name=?, client_ip=?, item_name=? WHERE id=?',
+                                           (device, ip, item_name, existing['id']))
+                          else:
+                              conn.execute('''INSERT INTO playback_logs 
+                                              (server_id, emby_user_id, username, device_name, client_ip, item_name, item_type, start_time)
+                                              VALUES (?,?,?,?,?,?,?,?)''',
+                                           (srv['id'], uid, username, device, ip, item_name, item_type, now))
+                      open_logs = conn.execute(
+                          'SELECT id, emby_user_id, start_time FROM playback_logs WHERE server_id=? AND end_time IS NULL',
+                          (srv['id'],)
+                      ).fetchall()
+                      for log in open_logs:
+                          if log['emby_user_id'] not in active_user_ids:
+                              end_time = datetime.now().isoformat()
+                              start = datetime.fromisoformat(log['start_time'])
+                              duration = int((datetime.now() - start).total_seconds())
+                              conn.execute('UPDATE playback_logs SET end_time=?, duration_sec=? WHERE id=?',
+                                           (end_time, duration, log['id']))
+                      conn.commit()
+                  conn.close()
+              except Exception as e:
+                  print('Playback sync error:', e)
+              time.sleep(30)
+
+      threading.Thread(target=sync_playback, daemon=True).start()
+
       def login_required(f):
           @wraps(f)
           def decorated(*args, **kwargs):
@@ -128,8 +192,7 @@ services:
           conn = get_db()
           srv = conn.execute('SELECT id, name, url, api_key FROM servers LIMIT 1').fetchone()
           conn.close()
-          if not srv:
-              return 'No server configured', 404
+          if not srv: return 'No server configured', 404
           items_data = emby_api(srv['id'], 'Items?IncludeItemTypes=Movie,Series&SortBy=Random&Limit=60&Recursive=true&ImageTypeLimit=1&Fields=PrimaryImageAspectRatio')
           items = items_data.get('Items', []) if items_data else []
           return render_template('posters.html', server=srv, items=items)
@@ -157,4 +220,363 @@ services:
                   return redirect(url_for('register'))
               conn.execute('INSERT INTO users (server_id, emby_user_id, username, password_hash, expire_date, disabled, created_at) VALUES (?,?,?,?,?,?,?)',
                            (server_id, user_id['Id'], username, hash_pass(password), None, 0, datetime.now().isoformat()))
-  
+              conn.commit()
+              conn.close()
+              flash('Registration successful! Welcome to the Wandering Earth.', 'success')
+              return redirect(url_for('login'))
+          conn.close()
+          return render_template('register.html', servers=servers)
+
+      @app.route('/login', methods=['GET','POST'])
+      def login():
+          if request.method == 'POST':
+              username = request.form['username'].strip()
+              password = request.form['password'].strip()
+              conn = get_db()
+              user = conn.execute('SELECT id, password_hash FROM users WHERE username=?', (username,)).fetchone()
+              conn.close()
+              if user and user['password_hash'] == hash_pass(password):
+                  session['user_id'] = user['id']
+                  return redirect(url_for('dashboard'))
+              flash('Invalid credentials', 'error')
+          return render_template('login.html')
+
+      @app.route('/logout')
+      def logout():
+          session.clear()
+          return redirect(url_for('login'))
+
+      @app.route('/dashboard')
+      @login_required
+      def dashboard():
+          conn = get_db()
+          user = conn.execute('''SELECT u.id, u.username, u.expire_date, u.disabled, u.blocked_devices, s.name as server_name, s.lines 
+                                 FROM users u JOIN servers s ON u.server_id=s.id WHERE u.id=?''', (session['user_id'],)).fetchone()
+          my_requests = conn.execute('SELECT * FROM requests WHERE user_id=? ORDER BY created_at DESC', (session['user_id'],)).fetchall()
+          conn.close()
+          lines = user['lines'].split(',') if user['lines'] else []
+          return render_template('dashboard.html', user=user, lines=lines, requests=my_requests)
+
+      @app.route('/use_card', methods=['POST'])
+      @login_required
+      def use_card():
+          code = request.form['code'].strip()
+          conn = get_db()
+          card = conn.execute('SELECT id, days, is_used FROM cards WHERE code=?', (code,)).fetchone()
+          if not card or card['is_used']:
+              flash('Invalid or already used card', 'error')
+              conn.close()
+              return redirect(url_for('dashboard'))
+          conn.execute('UPDATE cards SET is_used=1, used_by=?, used_at=? WHERE id=?',
+                       (session['user_id'], datetime.now().isoformat(), card['id']))
+          user = conn.execute('SELECT expire_date FROM users WHERE id=?', (session['user_id'],)).fetchone()
+          if user['expire_date']:
+              expire = datetime.fromisoformat(user['expire_date'])
+          else:
+              expire = datetime.now()
+          new_expire = expire + timedelta(days=card['days'])
+          conn.execute('UPDATE users SET expire_date=? WHERE id=?', (new_expire.date().isoformat(), session['user_id']))
+          conn.commit()
+          conn.close()
+          flash(f'Account extended by {card[\"days\"]} days', 'success')
+          return redirect(url_for('dashboard'))
+
+      @app.route('/request', methods=['POST'])
+      @login_required
+      def submit_request():
+          title = request.form['title'].strip()
+          year = request.form.get('year', '').strip()
+          rtype = request.form.get('type', 'movie')
+          if not title:
+              flash('Title required', 'error')
+              return redirect(url_for('dashboard'))
+          conn = get_db()
+          conn.execute('INSERT INTO requests (user_id, title, year, type, created_at) VALUES (?,?,?,?,?)',
+                       (session['user_id'], title, year, rtype, datetime.now().isoformat()))
+          conn.commit()
+          conn.close()
+          flash('Request submitted, pending review', 'success')
+          return redirect(url_for('dashboard'))
+
+      @app.route('/admin/login', methods=['GET','POST'])
+      def admin_login():
+          if request.method == 'POST':
+              if request.form['username'] == ADMIN_USER and request.form['password'] == ADMIN_PASS:
+                  session['admin_logged_in'] = True
+                  return redirect(url_for('admin_index'))
+              flash('Invalid credentials', 'error')
+          return render_template('admin_login.html')
+
+      @app.route('/admin/logout')
+      def admin_logout():
+          session.pop('admin_logged_in', None)
+          return redirect(url_for('admin_login'))
+
+      @app.route('/admin')
+      @admin_required
+      def admin_index():
+          conn = get_db()
+          users = conn.execute('''SELECT u.id, u.username, u.expire_date, u.disabled, u.blocked_devices, s.name as server 
+                                  FROM users u JOIN servers s ON u.server_id=s.id ORDER BY u.id DESC''').fetchall()
+          conn.close()
+          return render_template('admin.html', users=users)
+
+      @app.route('/admin/user/<int:user_id>/action', methods=['POST'])
+      @admin_required
+      def user_action(user_id):
+          action = request.form['action']
+          conn = get_db()
+          user = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+          if not user:
+              flash('User not found', 'error'); conn.close(); return redirect(url_for('admin_index'))
+
+          if action == 'delete':
+              emby_api(user['server_id'], f\"Users/{user['emby_user_id']}\", 'DELETE')
+              conn.execute('DELETE FROM users WHERE id=?', (user_id,))
+              conn.commit()
+              flash('Deleted', 'success')
+          elif action in ('disable','enable'):
+              disabled = 1 if action == 'disable' else 0
+              emby_api(user['server_id'], f\"Users/{user['emby_user_id']}/Policy\", 'POST', {'IsDisabled': bool(disabled)})
+              conn.execute('UPDATE users SET disabled=? WHERE id=?', (disabled, user_id))
+              conn.commit()
+              flash('Status updated', 'success')
+          elif action == 'reset_password':
+              new_pw = request.form['new_password'].strip()
+              if new_pw:
+                  emby_api(user['server_id'], f\"Users/{user['emby_user_id']}/Password\", 'POST', {'Id': user['emby_user_id'], 'Password': new_pw})
+                  conn.execute('UPDATE users SET password_hash=? WHERE id=?', (hash_pass(new_pw), user_id))
+                  conn.commit()
+                  flash('Password reset', 'success')
+          elif action == 'set_expire':
+              expire_str = request.form.get('expire_date', '').strip()
+              if expire_str:
+                  try: datetime.strptime(expire_str, '%Y-%m-%d'); conn.execute('UPDATE users SET expire_date=? WHERE id=?', (expire_str, user_id))
+                  except: flash('Invalid date', 'error')
+              else: conn.execute('UPDATE users SET expire_date=NULL WHERE id=?', (user_id,))
+              conn.commit()
+              flash('Expire updated', 'success')
+          elif action == 'block_devices':
+              devices = ','.join(request.form.getlist('devices'))
+              conn.execute('UPDATE users SET blocked_devices=? WHERE id=?', (devices, user_id))
+              conn.commit()
+              try:
+                  emby_api(user['server_id'], f\"Users/{user['emby_user_id']}/Policy\", 'POST',
+                           {'BlockedChannels': devices.split(',') if devices else []})
+              except: pass
+              flash('Blocked devices updated', 'success')
+          conn.close()
+          return redirect(url_for('admin_index'))
+
+      @app.route('/admin/servers')
+      @admin_required
+      def admin_servers():
+          conn = get_db()
+          servers = conn.execute('SELECT * FROM servers').fetchall()
+          conn.close()
+          return render_template('admin_servers.html', servers=servers)
+
+      @app.route('/admin/servers/add', methods=['POST'])
+      @admin_required
+      def add_server():
+          name = request.form['name'].strip()
+          url = request.form['url'].rstrip('/')
+          api_key = request.form['api_key'].strip()
+          lines = request.form.get('lines', '').strip()
+          if name and url and api_key:
+              conn = get_db()
+              conn.execute('INSERT INTO servers (name, url, api_key, lines) VALUES (?,?,?,?)', (name, url, api_key, lines))
+              conn.commit()
+              conn.close()
+              flash('Server added', 'success')
+          return redirect(url_for('admin_servers'))
+
+      @app.route('/admin/servers/<int:sid>/delete')
+      @admin_required
+      def delete_server(sid):
+          conn = get_db()
+          conn.execute('DELETE FROM servers WHERE id=?', (sid,))
+          conn.commit()
+          conn.close()
+          flash('Server removed', 'success')
+          return redirect(url_for('admin_servers'))
+
+      @app.route('/admin/requests')
+      @admin_required
+      def admin_requests():
+          conn = get_db()
+          all_req = conn.execute('''SELECT r.*, u.username FROM requests r JOIN users u ON r.user_id=u.id ORDER BY r.created_at DESC''').fetchall()
+          conn.close()
+          return render_template('admin_requests.html', requests=all_req)
+
+      @app.route('/admin/requests/<int:rid>/approve')
+      @admin_required
+      def approve_request(rid):
+          conn = get_db()
+          req = conn.execute('SELECT * FROM requests WHERE id=?', (rid,)).fetchone()
+          if req:
+              conn.execute('UPDATE requests SET status=\"approved\" WHERE id=?', (rid,))
+              conn.commit()
+              if MOVIEPILOT_URL and MOVIEPILOT_API_KEY:
+                  try:
+                      mp_data = {'name': req['title'], 'year': req['year'], 'type': req['type']}
+                      requests.post(f'{MOVIEPILOT_URL}/api/v1/subscribe', json=mp_data,
+                                    headers={'Authorization': MOVIEPILOT_API_KEY}, timeout=8)
+                  except: pass
+              flash('Approved', 'success')
+          conn.close()
+          return redirect(url_for('admin_requests'))
+
+      @app.route('/admin/requests/<int:rid>/reject')
+      @admin_required
+      def reject_request(rid):
+          conn = get_db()
+          conn.execute('UPDATE requests SET status=\"rejected\" WHERE id=?', (rid,))
+          conn.commit()
+          conn.close()
+          flash('Rejected', 'success')
+          return redirect(url_for('admin_requests'))
+
+      @app.route('/admin/cards')
+      @admin_required
+      def admin_cards():
+          conn = get_db()
+          cards = conn.execute('SELECT * FROM cards ORDER BY id DESC').fetchall()
+          conn.close()
+          return render_template('admin_cards.html', cards=cards)
+
+      @app.route('/admin/cards/generate', methods=['POST'])
+      @admin_required
+      def generate_cards():
+          days = int(request.form['days'])
+          count = int(request.form['count'])
+          codes = []
+          conn = get_db()
+          for _ in range(count):
+              code = ''.join(random.choices(string.ascii_uppercase+string.digits, k=12))
+              conn.execute('INSERT INTO cards (code, days, created_by) VALUES (?,?,?)', (code, days, 'admin'))
+              codes.append(code)
+          conn.commit()
+          conn.close()
+          flash(f'{count} cards generated', 'success')
+          return redirect(url_for('admin_cards'))
+
+      @app.route('/admin/monitor')
+      @admin_required
+      def admin_monitor():
+          return render_template('admin_monitor.html')
+
+      @app.route('/api/playback/current')
+      @admin_required
+      def api_current_playback():
+          conn = get_db()
+          logs = conn.execute('''SELECT p.*, s.name as server_name FROM playback_logs p 
+                                 JOIN servers s ON p.server_id=s.id 
+                                 WHERE p.end_time IS NULL ORDER BY p.start_time DESC''').fetchall()
+          conn.close()
+          return jsonify([dict(x) for x in logs])
+
+      @app.route('/api/playback/stats')
+      @admin_required
+      def api_playback_stats():
+          conn = get_db()
+          devices = conn.execute('SELECT device_name, COUNT(*) as cnt FROM playback_logs GROUP BY device_name').fetchall()
+          top_users = conn.execute('''SELECT username, SUM(duration_sec) as total_sec 
+                                      FROM playback_logs WHERE duration_sec>0 
+                                      GROUP BY username ORDER BY total_sec DESC LIMIT 10''').fetchall()
+          ip_data = conn.execute('SELECT client_ip, COUNT(*) as cnt FROM playback_logs GROUP BY client_ip ORDER BY cnt DESC').fetchall()
+          conn.close()
+          return jsonify({
+              'devices': [dict(x) for x in devices],
+              'top_users': [dict(x) for x in top_users],
+              'ips': [dict(x) for x in ip_data]
+          })
+
+      if __name__ == '__main__':
+          app.run(host='0.0.0.0', port=5000, debug=False)
+      PYEOF
+
+      cat > templates/style.html << 'STYLEEOF'
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Exo+2:wght@300;400;600&display=swap" rel="stylesheet">
+      <style>
+        * { margin:0; padding:0; box-sizing:border-box; }
+        :root {
+          --ice: #00b4d8; --engine: #ff6b35; --dark: #050a14;
+          --panel-bg: rgba(8, 20, 40, 0.8); --border: #1e3b5a; --text: #c8d6e5;
+          --glow: 0 0 20px rgba(0,180,216,0.5);
+        }
+        body {
+          font-family: 'Exo 2', sans-serif; background: var(--dark);
+          background-image: radial-gradient(ellipse at 30% 30%, rgba(0,180,216,0.12) 0%, transparent 50%),
+                            radial-gradient(ellipse at 70% 70%, rgba(255,107,53,0.08) 0%, transparent 50%);
+          color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center;
+          flex-direction: column; padding: 30px 20px; overflow-x: hidden; position: relative;
+        }
+        body::before {
+          content: ''; position: fixed; top:0; left:0; width:100%; height:100%;
+          background-image: radial-gradient(2px 2px at 20% 30%, rgba(255,255,255,0.3), transparent),
+                            radial-gradient(2px 2px at 60% 70%, rgba(255,255,255,0.2), transparent),
+                            radial-gradient(1px 1px at 90% 20%, rgba(255,255,255,0.4), transparent),
+                            radial-gradient(2px 2px at 15% 80%, rgba(255,255,255,0.2), transparent);
+          background-size: 200px 200px; animation: drift 30s linear infinite; pointer-events: none; z-index:0;
+        }
+        @keyframes drift { 0% { background-position: 0 0; } 100% { background-position: -200px 200px; } }
+        body::after {
+          content: ''; position: fixed; top:0; left:0; width:100%; height:100%;
+          background: linear-gradient(90deg, transparent, rgba(0,180,216,0.02), transparent);
+          animation: scan 8s linear infinite; pointer-events: none; z-index:0;
+        }
+        @keyframes scan { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+        .container { position: relative; z-index:1; width: 100%; max-width: 600px; margin:0 auto; }
+        .card {
+          background: var(--panel-bg); backdrop-filter: blur(20px); border: 1px solid var(--border);
+          border-radius: 24px; padding: 40px 35px;
+          box-shadow: 0 0 40px rgba(0,180,216,0.2), inset 0 0 30px rgba(0,180,216,0.05);
+          position: relative; transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .card:hover { transform: translateY(-3px); box-shadow: 0 0 60px rgba(0,180,216,0.4), inset 0 0 40px rgba(0,180,216,0.08); }
+        .card::before {
+          content: ''; position: absolute; top:0; left:0; right:0; bottom:0; border-radius: 24px; padding: 2px;
+          background: linear-gradient(135deg, var(--ice), transparent, var(--engine), transparent);
+          -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+          -webkit-mask-composite: xor; mask-composite: exclude; pointer-events: none;
+        }
+        h1, h2, h3 { font-family: 'Orbitron', sans-serif; text-transform: uppercase; letter-spacing: 4px; color: #fff; text-shadow: 0 0 20px var(--ice); margin-bottom: 25px; text-align: center; }
+        h2 { font-size: 2rem; }
+        .form-group { margin-bottom: 22px; }
+        label { display: block; font-family: 'Orbitron', sans-serif; font-size: 0.8rem; letter-spacing: 3px; color: var(--ice); margin-bottom: 10px; }
+        input, select, textarea {
+          width: 100%; padding: 14px 18px; background: rgba(10, 25, 45, 0.7); border: 1px solid var(--border);
+          border-radius: 12px; color: #e0f0ff; font-family: 'Exo 2', sans-serif; font-size: 1rem; transition: all 0.3s; outline: none;
+        }
+        input:focus, select:focus, textarea:focus { border-color: var(--ice); box-shadow: 0 0 20px rgba(0,180,216,0.4); }
+        .btn {
+          display: inline-block; width: 100%; padding: 16px 20px; background: linear-gradient(135deg, #0a2a3f, #003b5c);
+          border: 1px solid var(--ice); color: #fff; font-family: 'Orbitron', sans-serif; font-size: 1rem; letter-spacing: 3px;
+          text-transform: uppercase; cursor: pointer; border-radius: 12px; transition: all 0.3s; position: relative; overflow: hidden;
+          text-shadow: 0 0 15px var(--ice);
+        }
+        .btn::after {
+          content: ''; position: absolute; top:0; left:-100%; width:100%; height:100%;
+          background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent); transition: left 0.5s;
+        }
+        .btn:hover::after { left: 100%; }
+        .btn:hover { background: linear-gradient(135deg, #0d3a55, #005f8c); box-shadow: 0 0 35px rgba(0,180,216,0.7); transform: translateY(-2px); }
+        .btn-danger { background: linear-gradient(135deg, #3a1515, #6b1a1a); border-color: #ff4444; text-shadow: 0 0 10px #ff4444; }
+        .btn-danger:hover { background: linear-gradient(135deg, #5a2020, #8b2222); box-shadow: 0 0 35px rgba(255,68,68,0.6); }
+        .btn-sm { width: auto; padding: 10px 20px; font-size: 0.8rem; margin: 5px; }
+        .alert { padding: 14px 18px; margin-bottom: 20px; border-radius: 12px; background: rgba(0,180,216,0.1); border-left: 4px solid var(--ice); color: #d0e8ff; font-size: 0.9rem; font-family: 'Orbitron', sans-serif; }
+        .alert-error { border-left-color: #ff4444; background: rgba(255,68,68,0.1); }
+        a { color: var(--ice); text-decoration: none; border-bottom: 1px dotted var(--ice); transition: color 0.3s; }
+        a:hover { color: #fff; }
+        .footer-link { margin-top: 25px; text-align: center; font-size: 0.9rem; }
+        .admin-wide { max-width: 1300px; }
+        table { width: 100%; border-collapse: separate; border-spacing: 0 8px; margin: 20px 0; }
+        th { font-family: 'Orbitron', sans-serif; text-align: left; padding: 16px 12px; color: var(--ice); font-size: 0.85rem; letter-spacing: 2px; border-bottom: 2px solid var(--ice); }
+        td { padding: 16px 12px; background: rgba(10, 25, 45, 0.5); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); transition: background 0.3s; }
+        tr td:first-child { border-left: 1px solid var(--border); border-radius: 12px 0 0 12px; }
+        tr td:last-child { border-right: 1px solid var(--border); border-radius: 0 12px 12px 0; }
+        tr:hover td { background: rgba(0,180,216,0.08); }
+        .badge { display: in
