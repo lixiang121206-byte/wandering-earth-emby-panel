@@ -4,12 +4,6 @@
 > 基于《流浪地球》视觉风格的 Emby 账号管理面板，支持多服务器切换、多线路展示、海报墙、求片订阅、卡密续费、播放监控与设备 IP 记录等功能。  
 > 单个 `docker-compose.yml` 一键部署，无需额外文件。
 
-[![GitHub stars](https://img.shields.io/github/stars/yourname/wandering-earth-emby-panel?style=social)](https://github.com/yourname/wandering-earth-emby-panel)  
-[![Docker Pulls](https://img.shields.io/docker/pulls/yourname/wandering-earth-emby-panel)](https://hub.docker.com/r/yourname/wandering-earth-emby-panel)  
-![License](https://img.shields.io/github/license/yourname/wandering-earth-emby-panel)
-
----
-
 ## ✨ 功能特性
 
 - 🎬 **流浪地球主题 UI**：深空星云背景、动态行星发动机光束、全息玻璃拟态卡片、流光按钮  
